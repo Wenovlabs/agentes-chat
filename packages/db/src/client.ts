@@ -5,6 +5,7 @@ import type { PgDatabase, PgDialect, PgQueryResultHKT, PgSession } from "drizzle
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
+import { migrateFork } from "./fork";
 import { assertMigrationsMatch } from "./migration-guard";
 import { openPglite, pgliteFolder } from "./pglite";
 import * as schema from "./schema";
@@ -113,6 +114,7 @@ export function createDatabase(options: DatabaseOptions): DatabaseHandle {
           await Bun.sleep(500);
         await assertMigrationsMatch(db as unknown as Database, migrationsFolder);
         await migrateInSteps(db, migrationsFolder);
+        await migrateFork(db as never);
         const [unlocked] = await lock`select pg_advisory_unlock(${MIGRATIONS_LOCK}::bigint) as ok`;
         // Not held any more: the lock's session ended on the way, and another process may have migrated meanwhile.
         if (!unlocked?.ok) throw new Error("the migrations lock was lost while migrating");
@@ -148,6 +150,7 @@ function createPgliteDatabase(folder: string): DatabaseHandle {
       await ready;
       await assertMigrationsMatch(db as unknown as Database, migrationsFolder);
       await migrateInSteps(db, migrationsFolder);
+      await migrateFork(db as never);
     },
     ping: async () => {
       await ready;

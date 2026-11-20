@@ -9,6 +9,7 @@ import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { type Database, migrateInSteps, migrationsFolder } from "../src/client";
+import { forkMigrationsFolder, migrateFork } from "../src/fork";
 import * as schema from "../src/schema";
 import { tracingLogger } from "../src/trace";
 
@@ -51,7 +52,9 @@ async function loadTemplate(): Promise<Blob> {
   if (existsSync(file)) return new Blob([readFileSync(file)]);
 
   const client = new PGlite({ extensions: { vector } });
-  await migrateInSteps(drizzlePglite(client, { schema, casing: "snake_case" }), migrationsFolder);
+  const tdb = drizzlePglite(client, { schema, casing: "snake_case" });
+  await migrateInSteps(tdb, migrationsFolder);
+  await migrateFork(tdb as never);
   const dump = await client.dumpDataDir("none");
   await client.close();
   // Written beside its final name and moved there: a process starting meanwhile never reads half a file.
@@ -73,6 +76,8 @@ function templateKey(): string {
   for (const name of readdirSync(migrationsFolder).sort()) {
     if (name.endsWith(".sql")) hash.update(name).update(readFileSync(join(migrationsFolder, name)));
   }
+  for (const name of readdirSync(forkMigrationsFolder).sort())
+    hash.update(name).update(readFileSync(join(forkMigrationsFolder, name)));
   return hash.digest("hex").slice(0, 32);
 }
 
@@ -97,6 +102,7 @@ async function createOnServer(serverUrl: string) {
   const client = postgres(url.toString(), { max: 5, onnotice: () => {} });
   const db = drizzlePostgres(client, { schema, casing: "snake_case", logger: tracingLogger });
   await migrateInSteps(db, migrationsFolder);
+  await migrateFork(db as never);
 
   return {
     db: db as unknown as Database,
