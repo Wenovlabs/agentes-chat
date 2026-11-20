@@ -28,6 +28,7 @@ export {
   sum,
 } from "drizzle-orm";
 export * from "./client";
+export * from "./fork";
 export * from "./migration-guard";
 export * from "./pglite";
 export * as schema from "./schema";
