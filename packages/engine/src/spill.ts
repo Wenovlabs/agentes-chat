@@ -1,5 +1,5 @@
 import type { PlanUsage } from "@agenteschat/adapters";
-import { and, type Executor, eq, inArray, isNull, ne, or, schema, sql } from "@agenteschat/db";
+import { and, type Executor, eq, inArray, isNull, ne, or, schema, sql, weeklyQuotaPolicy } from "@agenteschat/db";
 import { isAutoModel } from "@agenteschat/providers";
 import { autoPlanModel, claudeCodeModel, NEXT_ACCOUNT_KINDS, planOf } from "@agenteschat/providers/plans";
 import type { Agent } from "./agents";
@@ -8,6 +8,7 @@ import type { BrainAccount, BrainSession } from "./brains/types";
 import { machineRule, mayUseDevice } from "./devices";
 import type { MachineStatus } from "./machine-hub";
 import { isRightHand } from "./right-hand";
+import { Reservations, rankByWeeklyReset } from "./weekly-quota";
 
 const { agentRuns, machineAccounts, machines } = schema;
 
@@ -106,6 +107,9 @@ const sameSeat = (a: SeatRow, b: SeatRow) =>
     a.email.toLowerCase() === b.email?.toLowerCase() &&
     (!a.providerOrgId || !b.providerOrgId || a.providerOrgId === b.providerOrgId));
 
+/** Claims of accounts chosen by starts happening at once (`rankByWeeklyReset`). */
+const reservations = new Reservations();
+
 type ChainAgent = Pick<Agent, "id" | "orgId" | "ownerUserId" | "brainAccountPinned" | "builtin">;
 
 /**
@@ -176,10 +180,19 @@ export async function nextAccountPlan(
         createdBy: machineAccounts.createdBy,
         ownerName: schema.users.name,
         usage: machineAccounts.usage,
+        weeklyCapPercent: weeklyQuotaPolicy.capPercent,
+        weeklyReleaseHours: weeklyQuotaPolicy.releaseHours,
       })
       .from(machineAccounts)
       .innerJoin(schema.organizationMembers, ownerIsMember)
       .leftJoin(schema.users, eq(schema.users.id, machineAccounts.createdBy))
+      .leftJoin(
+        weeklyQuotaPolicy,
+        and(
+          eq(weeklyQuotaPolicy.orgId, machineAccounts.orgId),
+          eq(weeklyQuotaPolicy.machineAccountId, machineAccounts.id),
+        ),
+      )
       .where(
         and(
           chainWhere(agent, plan.kind, machineId, options.forPerson ?? null, keep),
@@ -197,7 +210,22 @@ export async function nextAccountPlan(
   const now = Date.now();
   const chain: SeatRow[] = [];
   let earliest: number | null = null;
-  for (const r of rows) {
+  // Weekly quota: among the accounts a run may go on with, the nearest weekly reset first (within each cap, lifted in
+  // the final window); readings that are missing or stale keep the workspace's order, after the known ones.
+  const rank = new Map(
+    rankByWeeklyReset(
+      rows.map((r) => ({
+        id: r.id,
+        usage: (r.usage as PlanUsage | null) ?? null,
+        policy: { capPercent: r.weeklyCapPercent, releaseHours: r.weeklyReleaseHours },
+      })),
+      now,
+      (id) => reservations.percent(id, now),
+    ).map((id, i) => [id, i] as const),
+  );
+  const ordered = [...rows].sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9));
+  for (const r of ordered) {
+    if (!rank.has(r.id) && !tried.includes(r.id)) continue;
     const account: BrainAccount = { id: r.id, label: r.label, status: "active" };
     const usage = (r.usage as PlanUsage | null) ?? null;
     const model = isAutoModel(plan.model) ? autoPlanModel(undefined, plan.model, usage) : plan.model;
@@ -211,6 +239,7 @@ export async function nextAccountPlan(
     if (why || tried.includes(r.id) || triedRows.some((t) => sameSeat(t, r))) continue;
     if (options.room && !options.room(usage, r.id)) continue;
     const { unavailable: _, usage: _usage, ...rest } = plan;
+    reservations.claim(r.id, now);
     return {
       plan: {
         ...rest,
